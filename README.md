@@ -2,13 +2,17 @@
 [![API Docs](https://docs.rs/imgui-vulkano-renderer/badge.svg)](https://docs.rs/imgui-vulkano-renderer/)
 ![Liscense](https://img.shields.io/crates/l/imgui-vulkano-renderer)
 
-# imgui-vulkano-renderer
+# Fork note
+This is my rough attempt at upgrading this repository to the newest git version of Vulkano. I updated it for my own needs and I will try to keep it updated, but there's no guarantees of robustness, and things might not work with your usage.
+That being said, if you do have improvements, feel free to PR them.
+
+# imgui-vulkano-renderer (original README)
 
 A [vulkano]-based renderer for [imgui-rs].
 
 Warning: I've only used this renderer in a few examples and a couple projects, so there are likely some issues, but it seems to work with basic ImGui usage.
 
-Supports [imgui-rs] version `0.9` and [vulkano] version `0.32`. 
+Supports [imgui-rs] version `0.12` and [vulkano] version `0.36` (current git master branch). 
 
 ## Usage
 

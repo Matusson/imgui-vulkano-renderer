@@ -1,50 +1,43 @@
 mod cache;
 mod shader;
 
+use vulkano::command_buffer::raw::SubpassBeginInfo;
 use bytemuck::{Pod, Zeroable};
 use cache::DescriptorSetCache;
 use imgui::internal::RawWrapper;
 use imgui::{DrawCmd, DrawCmdParams, DrawVert, TextureId, Textures};
 use std::{fmt, sync::Arc};
-use vulkano::buffer::Subbuffer;
-use vulkano::command_buffer::SubpassBeginInfo;
+use vulkano::buffer::{IndexType, Subbuffer};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::ImageType::Dim2d;
-use vulkano::image::ImageUsage;
+use vulkano::image::{ImageLayout, ImageUsage};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, ColorBlendAttachmentState};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::vertex_input::VertexDefinition;
 use vulkano::pipeline::graphics::viewport::Viewport;
 use vulkano::pipeline::graphics::{vertex_input, GraphicsPipelineCreateInfo};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
-use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage},
-    command_buffer::{
-        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
-        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
-        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+use vulkano::{buffer::{Buffer, BufferCreateInfo, BufferUsage}, command_buffer::{
+    allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, PrimaryCommandBufferAbstract,
+}, descriptor_set::{
+    allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+}, device::{Device, Queue}, format::Format, image::{view::ImageView, Image, ImageCreateInfo}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
+    graphics::{
+        color_blend::ColorBlendState,
+        input_assembly::InputAssemblyState,
+        viewport::{Scissor, ViewportState},
     },
-    descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
-    },
-    device::{Device, Queue},
-    format::Format,
-    image::{view::ImageView, Image, ImageCreateInfo},
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    pipeline::{
-        graphics::{
-            color_blend::ColorBlendState,
-            input_assembly::InputAssemblyState,
-            viewport::{Scissor, ViewportState},
-        },
-        GraphicsPipeline, Pipeline, PipelineBindPoint,
-    },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass},
-    sync::GpuFuture,
-};
+    GraphicsPipeline, Pipeline, PipelineBindPoint,
+}, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass}, sync::GpuFuture, DeviceSize};
+use vulkano::command_buffer::raw::RenderPassBeginInfo;
+use vulkano::descriptor_set::{DescriptorImageInfo, DescriptorSetsCollection};
+use vulkano::descriptor_set::sys::RawDescriptorSet;
+use vulkano::memory::allocator::GenericMemoryAllocatorCreateInfo;
+use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
+use vulkano_taskgraph::command_buffer::RecordingCommandBuffer;
 
 #[derive(Default, Debug, Copy, Clone, vertex_input::Vertex, Zeroable, Pod)]
 #[repr(C)]
@@ -96,6 +89,108 @@ pub struct Allocators {
     pub command_buffers: Arc<StandardCommandBufferAllocator>,
 }
 
+struct BufferPool {
+    vertex_buffers: Vec<Subbuffer<[Vertex]>>,
+    index_buffers: Vec<Subbuffer<[u16]>>,
+    framebuffer: Option<Arc<Framebuffer>>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            vertex_buffers: Vec::new(),
+            index_buffers: Vec::new(),
+            framebuffer: None,
+        }
+    }
+
+    fn get_or_create_vertex_buffer(
+        &mut self,
+        allocator: &Arc<StandardMemoryAllocator>,
+        index: usize,
+        required_size: DeviceSize,
+    ) -> Result<Subbuffer<[Vertex]>, Box<dyn std::error::Error>> {
+        if index >= self.vertex_buffers.len() {
+            self.vertex_buffers.resize_with(index + 1, || {
+                Buffer::new_slice(
+                    allocator,
+                    &BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
+                    },
+                    &AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    1024,
+                ).unwrap()
+            });
+        }
+
+        if self.vertex_buffers[index].size() < required_size {
+            self.vertex_buffers[index] = Buffer::new_slice(
+                allocator,
+                &BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                required_size,
+            )?;
+        }
+
+        Ok(self.vertex_buffers[index].clone())
+    }
+
+    fn get_or_create_index_buffer(
+        &mut self,
+        allocator: &Arc<StandardMemoryAllocator>,
+        index: usize,
+        required_size: DeviceSize,
+    ) -> Result<Subbuffer<[u16]>, Box<dyn std::error::Error>> {
+        if index >= self.index_buffers.len() {
+            self.index_buffers.resize_with(index + 1, || {
+                Buffer::new_slice(
+                    allocator,
+                    &BufferCreateInfo {
+                        usage: BufferUsage::INDEX_BUFFER,
+                        ..Default::default()
+                    },
+                    &AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    1024,
+                ).unwrap()
+            });
+        }
+
+        if self.index_buffers[index].size() < required_size {
+            self.index_buffers[index] = Buffer::new_slice(
+                allocator,
+                &BufferCreateInfo {
+                    usage: BufferUsage::INDEX_BUFFER,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                required_size,
+            )?;
+        }
+
+        Ok(self.index_buffers[index].clone())
+    }
+}
+
 pub struct Renderer {
     render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
@@ -105,6 +200,8 @@ pub struct Renderer {
     allocators: Allocators,
 
     descriptor_set_cache: DescriptorSetCache,
+
+    buffer_pool: BufferPool,
 }
 
 impl Renderer {
@@ -130,26 +227,26 @@ impl Renderer {
     ) -> Result<Renderer, Box<dyn std::error::Error>> {
         let allocators = allocators.unwrap_or_else(|| Allocators {
             descriptor_sets: Arc::new(StandardDescriptorSetAllocator::new(
-                device.clone(),
-                Default::default(),
+                &device,
+                &Default::default(),
             )),
-            memory: Arc::new(StandardMemoryAllocator::new_default(device.clone())),
+            memory: Arc::new(StandardMemoryAllocator::new(&device, &GenericMemoryAllocatorCreateInfo::default())),
             command_buffers: Arc::new(StandardCommandBufferAllocator::new(
-                device.clone(),
-                StandardCommandBufferAllocatorCreateInfo::default(),
+                &device,
+                &StandardCommandBufferAllocatorCreateInfo::default(),
             )),
         });
 
-        let vs = shader::vs::load(device.clone())?
+        let vs = shader::vs::load(&device)?
             .entry_point("main")
             .ok_or("Failed to load vertex shader")?;
-        let fs = shader::fs::load(device.clone())?
-            .specialize([(0, gamma.unwrap_or(1.0).into())].into_iter().collect())?
+        let fs = shader::fs::load(&device)?
+            .specialize(&[(0, gamma.unwrap_or(1.0).into())])?
             .entry_point("main")
             .ok_or("Failed to load fragment shader")?;
 
         let render_pass = vulkano::single_pass_renderpass!(
-            device.clone(),
+            &device,
             attachments: {
                 color: {
                     format: format,
@@ -166,49 +263,46 @@ impl Renderer {
 
         let pipeline = {
             let subpass =
-                Subpass::from(render_pass.clone(), 0).ok_or("Failed to create subpass")?;
+                Subpass::new(&render_pass, 0).ok_or("Failed to create subpass")?;
             let vertex_input_state =
                 <Vertex as vertex_input::Vertex>::per_vertex().definition(&vs)?;
-            let stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ]
-            .into_iter()
-            .collect();
-            let layout = PipelineLayout::new(
-                device.clone(),
-                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                    .into_pipeline_layout_create_info(device.clone())?,
-            )?;
-            let color_blend_state = ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend::alpha()),
-                    ..Default::default()
-                },
-            );
+            let stages = &[
+                PipelineShaderStageCreateInfo::new(&vs),
+                PipelineShaderStageCreateInfo::new(&fs),
+            ];
+
+            let attachments = &[ColorBlendAttachmentState {
+                blend: Some(AttachmentBlend::alpha()),
+                ..Default::default()
+            }];
+
+            let layout = PipelineLayout::from_stages(&device, stages).unwrap();
+            let color_blend_state = ColorBlendState{
+                attachments,
+                ..Default::default()
+            };
+
+
             GraphicsPipeline::new(
-                device.clone(),
+                &device,
                 None,
-                GraphicsPipelineCreateInfo {
+                &GraphicsPipelineCreateInfo {
                     stages,
-                    vertex_input_state: Some(vertex_input_state),
-                    input_assembly_state: Some(InputAssemblyState::default()),
-                    viewport_state: Some(ViewportState {
-                        scissors: vec![Scissor::default()].into(),
+                    vertex_input_state: Some(&vertex_input_state),
+                    input_assembly_state: Some(&InputAssemblyState::default()),
+                    viewport_state: Some(&ViewportState {
+                        scissors: &[Scissor::default()],
                         ..Default::default()
                     }),
-                    multisample_state: Some(MultisampleState::default()),
-                    rasterization_state: Some(RasterizationState::default()),
-                    color_blend_state: Some(color_blend_state),
-                    dynamic_state: [
+                    multisample_state: Some(&MultisampleState::default()),
+                    rasterization_state: Some(&RasterizationState::default()),
+                    color_blend_state: Some(&color_blend_state),
+                    dynamic_state: &[
                         vulkano::pipeline::DynamicState::Viewport,
                         vulkano::pipeline::DynamicState::Scissor,
-                    ]
-                    .into_iter()
-                    .collect(),
-                    subpass: Some(subpass.into()),
-                    ..GraphicsPipelineCreateInfo::layout(layout)
+                    ],
+                    subpass: Some(PipelineSubpassType::from(&subpass)),
+                      ..GraphicsPipelineCreateInfo::new(&layout)
                 },
             )?
         };
@@ -233,6 +327,7 @@ impl Renderer {
             textures,
             allocators,
             descriptor_set_cache: DescriptorSetCache::default(),
+            buffer_pool: BufferPool::new(),
         })
     }
 
@@ -249,9 +344,9 @@ impl Renderer {
     /// `target`: the target image to render to
     ///
     /// `draw_data`: the ImGui `DrawData` that each UI frame creates
-    pub fn draw_commands(
+    pub unsafe fn draw_commands(
         &mut self,
-        cmd_buf_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        cmd_buf_builder: &mut RecordingCommandBuffer,
         target: Arc<ImageView>,
         draw_data: &imgui::DrawData,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -286,29 +381,45 @@ impl Renderer {
 
         let layout = &self.pipeline.layout().set_layouts()[0];
 
-        // Creating a new Framebuffer every frame isn't ideal, but according to this thread,
-        // it also isn't really an issue on desktop GPUs:
-        // https://github.com/GameTechDev/IntroductionToVulkan/issues/20
-        // This might be a good target for optimizations in the future though.
-        let framebuffer = Framebuffer::new(
-            self.render_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![target],
-                ..Default::default()
-            },
-        )?;
+        let framebuffer = if let Some(ref fb) = self.buffer_pool.framebuffer {
+            if fb.attachments()[0].image().extent() == target.image().extent() &&
+               fb.attachments()[0].format() == target.format() {
+                fb.clone()
+            } else {
+                let new_fb = Framebuffer::new(
+                    &self.render_pass,
+                    &FramebufferCreateInfo {
+                        attachments: &[&target],
+                        ..Default::default()
+                    },
+                )?;
+                self.buffer_pool.framebuffer = Some(new_fb.clone());
+                new_fb
+            }
+        } else {
+            let new_fb = Framebuffer::new(
+                &self.render_pass,
+                &FramebufferCreateInfo {
+                    attachments: &[&target],
+                    ..Default::default()
+                },
+            )?;
+            self.buffer_pool.framebuffer = Some(new_fb.clone());
+            new_fb
+        };
 
         let info = RenderPassBeginInfo {
-            clear_values: vec![None],
-            ..RenderPassBeginInfo::framebuffer(framebuffer)
+            clear_values: &[None],
+            ..RenderPassBeginInfo::new(&framebuffer)
         };
 
         cmd_buf_builder
-            .begin_render_pass(info, SubpassBeginInfo::default())?
-            .bind_pipeline_graphics(self.pipeline.clone())?;
+            .as_raw()
+            .begin_render_pass(&info, &SubpassBeginInfo::default())?
+            .bind_pipeline_graphics(&self.pipeline)?;
 
         if draw_data.draw_lists_count() > 0 { // Until https://github.com/imgui-rs/imgui-rs/pull/779 is published to crates.io
-            for draw_list in draw_data.draw_lists() {
+            for (draw_list_idx, draw_list) in draw_data.draw_lists().enumerate() {
                 let vertices: Vec<Vertex> = draw_list
                     .vtx_buffer()
                     .iter()
@@ -316,33 +427,20 @@ impl Renderer {
                     .collect();
                 let indices = draw_list.idx_buffer().to_vec();
 
-                let vertex_buffer = Buffer::from_iter(
-                    self.allocators.memory.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::VERTEX_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    vertices,
+                let vertex_buffer = self.buffer_pool.get_or_create_vertex_buffer(
+                    &self.allocators.memory,
+                    draw_list_idx,
+                    vertices.len() as DeviceSize,
                 )?;
 
-                let index_buffer = Buffer::from_iter(
-                    self.allocators.memory.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::INDEX_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    indices,
+                let index_buffer = self.buffer_pool.get_or_create_index_buffer(
+                    &self.allocators.memory,
+                    draw_list_idx,
+                    indices.len() as DeviceSize,
                 )?;
+
+                vertex_buffer.write()?[..vertices.len()].copy_from_slice(&vertices);
+                index_buffer.write()?[..indices.len()].copy_from_slice(&indices);
 
                 for cmd in draw_list.commands() {
                     match cmd {
@@ -382,23 +480,42 @@ impl Renderer {
                                         DescriptorSet::new(
                                             self.allocators.descriptor_sets.clone(),
                                             layout.clone(),
-                                            [WriteDescriptorSet::image_view_sampler(0, img, sampler)],
+                                            [WriteDescriptorSet::image(0,
+                                                                       DescriptorImageInfo{
+                                                                            image_view: Some(img),
+                                                                            sampler: Some(sampler),
+                                                                            image_layout:
+                                                                            ImageLayout::ShaderReadOnlyOptimal})
+                                            ],
                                             [],
                                         )
                                         .map_err(Into::into)
                                     },
                                 )?;
 
+                                let set_col = set.into_vec();
+
+                                let dynamic_offsets: Vec<u32> = set_col
+                                    .iter()
+                                    .flat_map(|x| x.as_ref().1.iter().copied())
+                                    .collect();
+                                let descriptor_sets: Vec<&RawDescriptorSet> = set_col
+                                    .iter()
+                                    .map(|x| x.as_ref().0.as_raw())
+                                    .collect();
+
                                 cmd_buf_builder
+                                    .as_raw()
                                     .bind_descriptor_sets(
                                         PipelineBindPoint::Graphics,
-                                        self.pipeline.layout().clone(),
+                                        &self.pipeline.layout(),
                                         0,
-                                        set.clone(),
+                                        &descriptor_sets,
+                                        &dynamic_offsets,
                                     )?
                                     .set_scissor(
                                         0,
-                                        std::iter::once(Scissor {
+                                        &[Scissor {
                                             offset: [
                                                 f32::max(0.0, clip_rect[0]).floor() as u32,
                                                 f32::max(0.0, clip_rect[1]).floor() as u32,
@@ -407,21 +524,26 @@ impl Renderer {
                                                 (clip_rect[2] - clip_rect[0]).abs().ceil() as u32,
                                                 (clip_rect[3] - clip_rect[1]).abs().ceil() as u32,
                                             ],
-                                        })
-                                        .collect(),
+                                        }],
                                     )?
                                     .set_viewport(
                                         0,
-                                        std::iter::once(Viewport {
+                                        &[Viewport {
                                             offset: [0.0, 0.0],
                                             extent: [dims[0] as f32, dims[1] as f32],
-                                            depth_range: 0.0..=1.0,
-                                        })
-                                        .collect(),
-                                    )?
-                                    .bind_vertex_buffers(0, vertex_buffer.clone())?
-                                    .bind_index_buffer(index_buffer.clone())?
-                                    .push_constants(self.pipeline.layout().clone(), 0, pc)?;
+                                            min_depth: 0.0,
+                                            max_depth: 1.0
+                                        }],
+                                    )?;
+
+                                cmd_buf_builder
+                                    .as_raw()
+                                    .bind_vertex_buffers(0, &[&vertex_buffer.buffer()],
+                                                         &[vertex_buffer.offset()],
+                                                         &[vertex_buffer.size()],
+                                                         &[])?
+                                    .bind_index_buffer(&index_buffer.buffer(), index_buffer.offset(), index_buffer.size(), IndexType::U16)?
+                                    .push_constants(&self.pipeline.layout(), 0, &pc)?;
                                 unsafe {
                                     cmd_buf_builder.draw_indexed(
                                         count as u32,
@@ -441,7 +563,7 @@ impl Renderer {
                 }
             }
         }
-        cmd_buf_builder.end_render_pass(Default::default())?;
+        cmd_buf_builder.as_raw().end_render_pass(&Default::default())?;
 
         Ok(())
     }
@@ -494,8 +616,8 @@ impl Renderer {
         )?;
 
         let image = Image::new(
-            allocators.memory.clone(),
-            ImageCreateInfo {
+            &allocators.memory,
+            &ImageCreateInfo {
                 image_type: Dim2d,
                 extent: [texture.width, texture.height, 1],
                 array_layers: 1,
@@ -504,16 +626,16 @@ impl Renderer {
                 usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
                 ..Default::default()
             },
-            AllocationCreateInfo::default(),
+            &AllocationCreateInfo::default(),
         )?;
 
         let upload_buffer: Subbuffer<[u8]> = Buffer::from_iter(
-            allocators.memory.clone(),
-            BufferCreateInfo {
+            &allocators.memory,
+            &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_HOST
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
@@ -521,7 +643,7 @@ impl Renderer {
             texture.data.iter().copied(),
         )?;
 
-        builder.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+        builder.copy_buffer_to_image(CopyBufferToImageInfo::new(
             upload_buffer,
             image.clone(),
         ))?;
@@ -533,10 +655,10 @@ impl Renderer {
             .then_signal_fence_and_flush()?
             .wait(None)?;
 
-        let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear())?;
+        let sampler = Sampler::new(&device, &SamplerCreateInfo::simple_repeat_linear())?;
 
         fonts.tex_id = TextureId::from(usize::MAX);
-        Ok((ImageView::new_default(image)?, sampler))
+        Ok((ImageView::new_default(&image)?, sampler))
     }
 
     fn lookup_texture<'a>(
