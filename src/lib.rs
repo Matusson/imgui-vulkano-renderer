@@ -5,7 +5,7 @@ use vulkano::command_buffer::raw::SubpassBeginInfo;
 use bytemuck::{Pod, Zeroable};
 use cache::DescriptorSetCache;
 use imgui::internal::RawWrapper;
-use imgui::{DrawCmd, DrawCmdParams, DrawVert, TextureId, Textures};
+use imgui::{DrawCmd, DrawCmdParams, DrawIdx, DrawVert, TextureId, Textures};
 use std::{fmt, sync::Arc};
 use vulkano::buffer::{IndexType, Subbuffer};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
@@ -35,7 +35,7 @@ use vulkano::{buffer::{Buffer, BufferCreateInfo, BufferUsage}, command_buffer::{
 use vulkano::command_buffer::raw::RenderPassBeginInfo;
 use vulkano::descriptor_set::{DescriptorImageInfo, DescriptorSetsCollection};
 use vulkano::descriptor_set::sys::RawDescriptorSet;
-use vulkano::memory::allocator::GenericMemoryAllocatorCreateInfo;
+use vulkano::memory::allocator::{DeviceLayout, GenericMemoryAllocatorCreateInfo};
 use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
 use vulkano_taskgraph::command_buffer::RecordingCommandBuffer;
 
@@ -427,16 +427,19 @@ impl Renderer {
                     .collect();
                 let indices = draw_list.idx_buffer().to_vec();
 
+                let vert_size = DeviceLayout::new_unsized::<[Vertex]>(vertices.len() as DeviceSize).unwrap();
                 let vertex_buffer = self.buffer_pool.get_or_create_vertex_buffer(
                     &self.allocators.memory,
                     draw_list_idx,
-                    vertices.len() as DeviceSize,
+                    vert_size.size()
                 )?;
+
+                let index_size = DeviceLayout::new_unsized::<[DrawIdx]>(indices.len() as DeviceSize).unwrap();
 
                 let index_buffer = self.buffer_pool.get_or_create_index_buffer(
                     &self.allocators.memory,
                     draw_list_idx,
-                    indices.len() as DeviceSize,
+                    index_size.size(),
                 )?;
 
                 vertex_buffer.write()?[..vertices.len()].copy_from_slice(&vertices);
