@@ -93,6 +93,8 @@ struct BufferPool {
     vertex_buffers: Vec<Subbuffer<[Vertex]>>,
     index_buffers: Vec<Subbuffer<[u16]>>,
     framebuffer: Option<Arc<Framebuffer>>,
+    old_vertex_buffers: Vec<Subbuffer<[Vertex]>>,
+    old_index_buffers: Vec<Subbuffer<[u16]>>,
 }
 
 impl BufferPool {
@@ -101,6 +103,8 @@ impl BufferPool {
             vertex_buffers: Vec::new(),
             index_buffers: Vec::new(),
             framebuffer: None,
+            old_vertex_buffers: Vec::new(),
+            old_index_buffers: Vec::new(),
         }
     }
 
@@ -129,19 +133,23 @@ impl BufferPool {
         }
 
         if self.vertex_buffers[index].size() < required_size {
-            self.vertex_buffers[index] = Buffer::new_slice(
-                allocator,
-                &BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                &AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                required_size,
-            )?;
+            let old_buffer = std::mem::replace(
+                &mut self.vertex_buffers[index],
+                Buffer::new_slice(
+                    allocator,
+                    &BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
+                    },
+                    &AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    required_size,
+                )?
+            );
+            self.old_vertex_buffers.push(old_buffer);
         }
 
         Ok(self.vertex_buffers[index].clone())
@@ -172,19 +180,23 @@ impl BufferPool {
         }
 
         if self.index_buffers[index].size() < required_size {
-            self.index_buffers[index] = Buffer::new_slice(
-                allocator,
-                &BufferCreateInfo {
-                    usage: BufferUsage::INDEX_BUFFER,
-                    ..Default::default()
-                },
-                &AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                required_size,
-            )?;
+            let old_buffer = std::mem::replace(
+                &mut self.index_buffers[index],
+                Buffer::new_slice(
+                    allocator,
+                    &BufferCreateInfo {
+                        usage: BufferUsage::INDEX_BUFFER,
+                        ..Default::default()
+                    },
+                    &AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    required_size,
+                )?
+            );
+            self.old_index_buffers.push(old_buffer);
         }
 
         Ok(self.index_buffers[index].clone())
@@ -481,16 +493,16 @@ impl Renderer {
                                         .clone();
 
                                         DescriptorSet::new(
-                                            self.allocators.descriptor_sets.clone(),
-                                            layout.clone(),
-                                            [WriteDescriptorSet::image(0,
-                                                                       DescriptorImageInfo{
-                                                                            image_view: Some(img),
-                                                                            sampler: Some(sampler),
+                                            &self.allocators.descriptor_sets,
+                                            &layout,
+                                            &[WriteDescriptorSet::image(0,
+                                                                       &DescriptorImageInfo{
+                                                                            image_view: Some(&img),
+                                                                            sampler: Some(&sampler),
                                                                             image_layout:
                                                                             ImageLayout::ShaderReadOnlyOptimal})
                                             ],
-                                            [],
+                                            &[],
                                         )
                                         .map_err(Into::into)
                                     },
@@ -545,7 +557,7 @@ impl Renderer {
                                                          &[vertex_buffer.offset()],
                                                          &[vertex_buffer.size()],
                                                          &[])?
-                                    .bind_index_buffer(&index_buffer.buffer(), index_buffer.offset(), index_buffer.size(), IndexType::U16)?
+                                    .bind_index_buffer(&index_buffer.buffer(), index_buffer.offset(), Some(index_buffer.size()), IndexType::U16)?
                                     .push_constants(&self.pipeline.layout(), 0, &pc)?;
                                 unsafe {
                                     cmd_buf_builder.draw_indexed(
@@ -602,6 +614,19 @@ impl Renderer {
     /// Get the texture library that the renderer uses
     pub fn textures(&self) -> &Textures<Texture> {
         &self.textures
+    }
+
+    // TODO: This isn't optimal, it requires pausing the render pipeline to clean up.
+    // You can either accept the cost of doing that (it won't happen super often, most likely),
+    // or you can eat the leaked memory. All resources should be tracked with the passed in task-graph,
+    // so that GC is automatic.
+
+    /// Clean up old buffers that are no longer in use.
+    /// Call this after GPU synchronization (e.g., after waiting for a fence or future)
+    /// to ensure old buffers that were replaced during resizing are properly destroyed.
+    pub fn cleanup_buffers(&mut self) {
+        self.buffer_pool.old_vertex_buffers.clear();
+        self.buffer_pool.old_index_buffers.clear();
     }
 
     fn upload_font_texture(
