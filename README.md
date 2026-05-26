@@ -2,9 +2,8 @@
 [![API Docs](https://docs.rs/imgui-vulkano-renderer/badge.svg)](https://docs.rs/imgui-vulkano-renderer/)
 ![Liscense](https://img.shields.io/crates/l/imgui-vulkano-renderer)
 
-# Fork note
-This is my rough attempt at upgrading this repository to the newest git version of Vulkano. I updated it for my own needs and I will try to keep it updated, but there's no guarantees of robustness, and things might not work with your usage.
-That being said, if you do have improvements, feel free to PR them.
+# Deprecation warning
+I have stopped developing this as a fork and I have re-implemented it from scratch to be fully taskgraph-native. The new repository is [imgui-vulkano-task-renderer](https://github.com/Matusson/imgui-vulkano-task-renderer).
 
 # imgui-vulkano-renderer (original README)
 
